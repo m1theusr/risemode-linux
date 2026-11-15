@@ -1,0 +1,12 @@
+[Unit]
+Description=Rise Mode water cooler - temperatura da CPU no display
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/risemode-tempd
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,266 @@
+#!/usr/bin/python3 -I
+"""
+risemode-tempd - envia temperatura/uso da CPU para o display do water cooler
+Rise Mode Aura Ice ARGB (HID "铭研科技 温度显示HID设备", VID 0xAA88 / PID 0x8666).
+
+Protocolo (extraído do "Rise Mode Temp CPU Driver R2.2" para Windows):
+  Output report de 11 bytes, sem report ID (byte 0 = 0x00):
+    [0] 0x00  report id
+    [1] temperatura CPU (°C)
+    [2] temperatura GPU (°C)
+    [3] uso CPU (%)
+    [4] uso memória (%)
+    [5] temperatura placa-mãe (°C)
+    [6] uso GPU (%)
+    [7..10] 0x00
+  Enviado a cada 1 s (padrão do software original).
+"""
+import argparse
+import glob
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+VID, PID = 0xAA88, 0x8666
+HID_ID_MATCH = f"{VID:08X}:{PID:08X}"
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+# ---------------------------------------------------------------- dispositivo
+def find_devices():
+    devs = []
+    for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        try:
+            with open(os.path.join(path, "device/uevent")) as f:
+                if HID_ID_MATCH in f.read().upper():
+                    devs.append("/dev/" + os.path.basename(path))
+        except OSError:
+            pass
+    return devs
+
+
+# ------------------------------------------------------------------- sensores
+def read_int(path):
+    try:
+        with open(path) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def read_str(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def hwmons():
+    for h in glob.glob("/sys/class/hwmon/hwmon*"):
+        yield h, read_str(os.path.join(h, "name"))
+
+
+def temps_by_label(h):
+    out = {}
+    for inp in glob.glob(os.path.join(h, "temp*_input")):
+        label = read_str(inp.replace("_input", "_label")) or os.path.basename(inp)
+        v = read_int(inp)
+        if v is not None:
+            out[label] = v / 1000.0
+    return out
+
+
+def cpu_temp():
+    """Intel coretemp (Package), AMD k10temp/zenpower (Tctl/Tdie), ou thermal zone."""
+    pkg = []
+    for h, name in hwmons():
+        if name == "coretemp":
+            t = temps_by_label(h)
+            pkg += [v for k, v in t.items() if k.startswith("Package")] or list(t.values())
+        elif name in ("k10temp", "zenpower"):
+            t = temps_by_label(h)
+            for key in ("Tdie", "Tctl"):
+                if key in t:
+                    pkg.append(t[key])
+                    break
+            else:
+                pkg += list(t.values())
+        elif name in ("cpu_thermal", "soc_thermal"):
+            pkg += list(temps_by_label(h).values())
+    if pkg:
+        return max(pkg)
+    for z in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if read_str(os.path.join(z, "type")) in ("x86_pkg_temp", "cpu-thermal"):
+            v = read_int(os.path.join(z, "temp"))
+            if v is not None:
+                return v / 1000.0
+    return 0.0
+
+
+class CpuUsage:
+    def __init__(self):
+        self.prev = self._read()
+
+    @staticmethod
+    def _read():
+        with open("/proc/stat") as f:
+            vals = [int(x) for x in f.readline().split()[1:]]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return idle, sum(vals)
+
+    def sample(self):
+        idle, total = self._read()
+        pi, pt = self.prev
+        self.prev = (idle, total)
+        dt = total - pt
+        return 0.0 if dt <= 0 else 100.0 * (1 - (idle - pi) / dt)
+
+
+def mem_usage():
+    info = {}
+    with open("/proc/meminfo") as f:
+        for line in f:
+            k, v = line.split(":", 1)
+            info[k] = int(v.split()[0])
+    total = info.get("MemTotal", 1)
+    return 100.0 * (1 - info.get("MemAvailable", total) / total)
+
+
+class Gpu:
+    """amdgpu/nouveau/i915 via hwmon; NVIDIA proprietário via nvidia-smi (cache)."""
+
+    def __init__(self, nvidia_period=3.0):
+        self.nvsmi = shutil.which("nvidia-smi")
+        self.period = nvidia_period
+        self.last = 0.0
+        self.cache = (0.0, 0.0)
+
+    def sample(self):
+        for h, name in hwmons():
+            if name in ("amdgpu", "nouveau", "i915", "xe"):
+                t = temps_by_label(h)
+                temp = t.get("edge", max(t.values()) if t else 0.0)
+                busy = read_int(os.path.join(h, "device/gpu_busy_percent")) or 0
+                return temp, float(busy)
+        if not self.nvsmi:
+            return 0.0, 0.0
+        now = time.monotonic()
+        if now - self.last >= self.period:
+            self.last = now
+            try:
+                out = subprocess.run(
+                    [self.nvsmi, "--query-gpu=temperature.gpu,utilization.gpu",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=2).stdout
+                t, u = out.splitlines()[0].split(",")
+                self.cache = (float(t), float(u))
+            except Exception:
+                self.cache = (0.0, 0.0)
+        return self.cache
+
+
+def board_temp(cpu_t, gpu_t):
+    """Mesmo cálculo estimado usado pelo software original quando não há sensor."""
+    for h, name in hwmons():
+        if name.startswith(("nct", "it87", "f71", "w83", "acpitz")):
+            t = temps_by_label(h)
+            for key in ("SYSTIN", "Motherboard", "temp1"):
+                if key in t and 0 < t[key] < 120:
+                    return t[key]
+    m = min(cpu_t, gpu_t) if gpu_t > 0 else cpu_t
+    return 30 + m * (0.2 if m > 45 else 0.15)
+
+
+def b(v):
+    return max(0, min(255, int(round(v))))
+
+
+# ----------------------------------------------------------------------- main
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("-i", "--interval", type=float, default=1.0, help="segundos entre envios (padrão 1)")
+    ap.add_argument("--offset", type=float, default=0.0, help="ajuste somado à temp. da CPU")
+    ap.add_argument("--no-gpu", action="store_true", help="não consultar GPU")
+    ap.add_argument("--once", action="store_true", help="envia uma vez e sai")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    args = ap.parse_args()
+
+    status_path = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "risemode-tempd.json")
+    running = True
+
+    def stop(*_):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    cpu = CpuUsage()
+    gpu = Gpu()
+    fds = {}
+    last_scan = 0.0
+    log(f"risemode-tempd iniciado (intervalo {args.interval}s)")
+
+    while running:
+        now = time.monotonic()
+        if not fds and now - last_scan > 2.0:
+            last_scan = now
+            for dev in find_devices():
+                try:
+                    fds[dev] = os.open(dev, os.O_WRONLY)
+                    log(f"conectado: {dev}")
+                except OSError as e:
+                    log(f"sem acesso a {dev}: {e} (instale a regra udev)")
+
+        ct = cpu_temp() + args.offset
+        gt, gu = (0.0, 0.0) if args.no_gpu else gpu.sample()
+        cu, mu = cpu.sample(), mem_usage()
+        bt = board_temp(ct, gt)
+        pkt = bytes([0, b(ct), b(gt), b(cu), b(mu), b(bt), b(gu), 0, 0, 0, 0])
+
+        for dev, fd in list(fds.items()):
+            try:
+                os.write(fd, pkt)
+            except OSError as e:
+                log(f"desconectado: {dev} ({e})")
+                os.close(fd)
+                del fds[dev]
+
+        if args.verbose:
+            log(f"cpu={ct:.0f}°C {cu:.0f}% gpu={gt:.0f}°C {gu:.0f}% mem={mu:.0f}% board={bt:.0f}°C -> {list(fds)}")
+
+        try:
+            tmp = status_path + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"ts": time.time(), "connected": bool(fds), "devices": list(fds),
+                           "cpu_temp": b(ct), "cpu_usage": b(cu), "gpu_temp": b(gt),
+                           "gpu_usage": b(gu), "mem_usage": b(mu)}, f)
+            os.replace(tmp, status_path)
+        except OSError:
+            pass
+
+        if args.once:
+            break
+        time.sleep(args.interval)
+
+    for fd in fds.values():
+        os.close(fd)
+    try:
+        os.unlink(status_path)
+    except OSError:
+        pass
+    log("risemode-tempd finalizado")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,7 @@
+{
+  "uuid": "risemode-cooler@m1theusr",
+  "name": "Rise Mode Cooler Display",
+  "description": "Liga/desliga o envio da temperatura da CPU para o display do water cooler Rise Mode Aura Ice (HID aa88:8666). Requer o serviço risemode-tempd.",
+  "shell-version": ["45", "46", "47", "48", "49", "50"],
+  "version": 1
+}
